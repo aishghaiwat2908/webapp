@@ -1,7 +1,8 @@
 import "@testing-library/jest-dom";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { renderWithProviders } from "#utils/test-utils";
 import VoluntaryOrganizations from "./VoluntaryOrganizations";
+import { formatDistance } from "./distanceUtils";
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -30,19 +31,32 @@ jest.mock("../../services/mlServices", () => ({
   getOrganizations: jest.fn(),
 }));
 
-jest.mock("../../common/components/Loading/Loading", () => () => (
-  <div data-testid="loading-indicator" />
-));
+jest.mock("../../common/components/Loading/Loading", () => {
+  const MockLoading = () => <div data-testid="loading-indicator" />;
+  MockLoading.displayName = "MockLoading";
+  return MockLoading;
+});
 
-jest.mock("../../common/components/DataTable/Table", () => (props) => (
-  <div data-testid="org-table">
-    {props.rows.map((row, i) => (
-      <div key={i} data-testid="org-row">
-        {row.name}
-      </div>
-    ))}
-  </div>
-));
+jest.mock("../../common/components/DataTable/Table", () => {
+  const PropTypes = jest.requireActual("prop-types");
+  const MockTable = ({ rows, requestSort }) => (
+    <div data-testid="org-table">
+      <button onClick={() => requestSort("distance")}>Sort distance</button>
+      {rows.map((row, i) => (
+        <div key={i} data-testid="org-row">
+          {row.name}
+          <span>{row.distance}</span>
+        </div>
+      ))}
+    </div>
+  );
+  MockTable.displayName = "MockTable";
+  MockTable.propTypes = {
+    rows: PropTypes.array.isRequired,
+    requestSort: PropTypes.func.isRequired,
+  };
+  return MockTable;
+});
 
 jest.mock("../../common/components/BreadCrumbs/breadcrumbUtils", () => ({
   createOrganizationDetailsTrail: jest.fn(() => []),
@@ -155,8 +169,8 @@ describe("VoluntaryOrganizations", () => {
     );
   });
 
-  // 6. API called with correct payload — request_id and beneficiary_id
-  it("calls API with request_id from requestData and beneficiary_id from requestData.userId", async () => {
+  // 6. Request identity is sufficient for the backend to resolve beneficiary.
+  it("calls API with request_id without treating requester userId as beneficiary", async () => {
     getOrganizations.mockResolvedValue([]);
     renderWithProviders(<VoluntaryOrganizations />, {
       preloadedState: MOCK_STATE,
@@ -165,30 +179,23 @@ describe("VoluntaryOrganizations", () => {
     expect(getOrganizations).toHaveBeenCalledWith(
       expect.objectContaining({
         request_id: "REQ-00-000-000-0001",
-        beneficiary_id: "SID-00-000-000-001",
       }),
     );
+    expect(getOrganizations.mock.calls[0][0]).not.toHaveProperty("beneficiary_id");
   });
 
-  // 7. beneficiary_id uses requestData.userId first, then userDbId from redux
-  it("uses requestData.userId as beneficiary_id when present (priority over redux userDbId)", async () => {
+  // 7. Requester ID is not necessarily beneficiary ID.
+  it("does not use requestData.userId or viewer userDbId as beneficiary_id", async () => {
     getOrganizations.mockResolvedValue([]);
     renderWithProviders(<VoluntaryOrganizations />, {
       preloadedState: MOCK_STATE,
     });
     await waitFor(() => expect(getOrganizations).toHaveBeenCalledTimes(1));
-    // requestData.userId = "SID-00-000-000-001" from mock useLocation
-    // userDbId from redux = "SID-00-000-000-999"
-    // requestData.userId takes priority
-    expect(getOrganizations).toHaveBeenCalledWith(
-      expect.objectContaining({
-        beneficiary_id: "SID-00-000-000-001",
-      }),
-    );
+    expect(getOrganizations.mock.calls[0][0]).not.toHaveProperty("beneficiary_id");
   });
 
-  // 8. Falls back to localStorage userDbId when redux has no userDbId
-  it("uses localStorage userDbId as beneficiary_id when redux user has no userDbId", async () => {
+  // 8. Viewer localStorage must not override the request's beneficiary.
+  it("does not use localStorage userDbId for distance calculation", async () => {
     localStorage.setItem("userDbId", "SID-FROM-LOCALSTORAGE");
     getOrganizations.mockResolvedValue([]);
     renderWithProviders(<VoluntaryOrganizations />, {
@@ -198,22 +205,18 @@ describe("VoluntaryOrganizations", () => {
     });
     await waitFor(() => expect(getOrganizations).toHaveBeenCalledTimes(1));
     const call = getOrganizations.mock.calls[0][0];
-    // beneficiary_id should be requestData.userId ("SID-00-000-000-001") since mock location has it
-    expect(call.beneficiary_id).toBeTruthy();
+    expect(call).not.toHaveProperty("beneficiary_id");
   });
 
-  // 9. Uses city from personalInfo in localStorage
-  it("uses city from personalInfo localStorage in payload", async () => {
+  // 9. Viewer address must not be sent as the beneficiary address.
+  it("does not send viewer personalInfo as a location", async () => {
     localStorage.setItem("personalInfo", JSON.stringify({ city: "San Jose" }));
     getOrganizations.mockResolvedValue([]);
     renderWithProviders(<VoluntaryOrganizations />, {
       preloadedState: MOCK_STATE,
     });
     await waitFor(() => expect(getOrganizations).toHaveBeenCalledTimes(1));
-    expect.objectContaining({
-      request_id: expect.any(String),
-      beneficiary_id: expect.any(String),
-    });
+    expect(getOrganizations.mock.calls[0][0]).not.toHaveProperty("location");
   });
 
   // 10. Search filters org list
@@ -261,5 +264,30 @@ describe("VoluntaryOrganizations", () => {
       preloadedState: MOCK_STATE,
     });
     expect(screen.getByText("Organizations")).toBeInTheDocument();
+  });
+
+  it("formats zero as 0 mi and missing or invalid distance as N/A", () => {
+    expect(formatDistance(0)).toBe("0 mi");
+    expect(formatDistance(12.6)).toBe("12.6 mi");
+    expect(formatDistance(null)).toBe("N/A");
+    expect(formatDistance("invalid")).toBe("N/A");
+  });
+
+  it("shows distance units and sorts numeric distances with N/A last", async () => {
+    getOrganizations.mockResolvedValue({ body: JSON.stringify([
+      { Name: "Far", distance: 12.6 },
+      { Name: "Unknown", distance: null },
+      { Name: "Same", distance: 0 },
+    ]) });
+    renderWithProviders(<VoluntaryOrganizations />, { preloadedState: MOCK_STATE });
+    await waitFor(() => expect(screen.getAllByTestId("org-row")).toHaveLength(3));
+    fireEvent.click(screen.getByText("Sort distance"));
+    const rows = screen.getAllByTestId("org-row");
+    expect(rows.map((row) => within(row).getByText(/mi|N\/A/).textContent)).toEqual([
+      "0 mi", "12.6 mi", "N/A",
+    ]);
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "Same0 mi", "Far12.6 mi", "UnknownN/A",
+    ]);
   });
 });

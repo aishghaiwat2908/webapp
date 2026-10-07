@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import Table from "../../common/components/DataTable/Table";
 import { getOrganizations } from "../../services/mlServices";
 import { useTranslation } from "react-i18next";
-import { useNavigate, useLocation } from "react-router-dom";
-import { useSelector } from "react-redux";
+import { useLocation } from "react-router-dom";
 import LoadingIndicator from "../../common/components/Loading/Loading";
 import { createOrganizationDetailsTrail } from "../../common/components/BreadCrumbs/breadcrumbUtils";
+import { formatDistance, numericDistance } from "./distanceUtils";
 
 const VoluntaryOrganizations = () => {
   const { t } = useTranslation();
@@ -18,7 +18,6 @@ const VoluntaryOrganizations = () => {
   const [rowsPerPage, setRowsPerPage] = useState(5);
   const [isLoading, setIsLoading] = useState(true);
   const [selectedOrg, setSelectedOrg] = useState(null);
-  const navigate = useNavigate();
   const headers = [
     "name",
     "organization_type",
@@ -36,51 +35,31 @@ const VoluntaryOrganizations = () => {
     : [];
   const requestId =
     requestData?.id ||
+    requestData?.request_id ||
     breadcrumbTrail
       .find((item) => item.path?.startsWith("/request/"))
       ?.path?.split("/")
       ?.pop();
 
-  // Get logged-in user's DB id from redux or localStorage (used for My Requests)
-  const userDbId =
-    useSelector((state) => state.auth.user?.userDbId) ||
-    localStorage.getItem("userDbId");
-
   if (!location.state) {
     console.warn("No requestData passed through navigation");
   }
 
-  const getVoluntaryOrganizations = async () => {
+  const getVoluntaryOrganizations = useCallback(async () => {
     try {
       setIsLoading(true);
-      const personalInfo = JSON.parse(
-        localStorage.getItem("personalInfo") || "{}",
-      );
-
-      // request_id comes from the request row the user clicked
-      const request_id = requestData?.id || "";
-
-      // beneficiary_id:
-      // - All Requests: use userId from the request row (the person who made the request)
-      // - My Requests: use logged-in user's userDbId
-      const beneficiary_id =
-        requestData?.beneficiaryId ||
-        requestData?.userId ||
-        requestData?.beneficiary_id ||
-        userDbId ||
-        "";
-
-      const payload = {
-        request_id,
-        beneficiary_id,
-      };
-
-      console.log("Org API payload:", payload);
+      // Never substitute the current viewer for the request beneficiary.
+      const beneficiary_id = requestData?.beneficiaryId || requestData?.beneficiary_id;
+      const payload = { request_id: requestId };
+      if (beneficiary_id) payload.beneficiary_id = beneficiary_id;
 
       const response = await getOrganizations(payload);
 
-      const organizationsArray =
-        response?.body || response?.data || response || [];
+      const responseBody = response?.body ?? response?.data ?? response ?? [];
+      const organizationsArray = typeof responseBody === "string"
+        ? JSON.parse(responseBody)
+        : responseBody;
+      if (!Array.isArray(organizationsArray)) throw new Error("Invalid organization response");
 
       // Sort: Collaborators first
       const sortedArray = [...organizationsArray].sort((a, b) => {
@@ -101,7 +80,8 @@ const VoluntaryOrganizations = () => {
         location: org.location || org.Location || "N/A",
         size: org.size || org.Size || "N/A",
         rating: org.rating || org.Rating || "N/A",
-        distance: org.distance || org.Distance || "N/A",
+        distance: formatDistance(org.distance ?? org.Distance),
+        _distanceValue: numericDistance(org.distance ?? org.Distance),
         _rawData: org,
       }));
 
@@ -112,13 +92,13 @@ const VoluntaryOrganizations = () => {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [requestId, requestData?.beneficiaryId, requestData?.beneficiary_id]);
 
   useEffect(() => {
     getVoluntaryOrganizations();
-  }, []);
+  }, [getVoluntaryOrganizations]);
 
-  const sortedOrganizations = (organizations) => {
+  const sortedData = useMemo(() => {
     if (!organizations || organizations.length === 0) {
       return [];
     }
@@ -133,6 +113,16 @@ const VoluntaryOrganizations = () => {
           valB = React.isValidElement(valB) ? "Yes" : valB;
         }
 
+        if (sortConfig.key === "distance") {
+          const distanceA = a._distanceValue;
+          const distanceB = b._distanceValue;
+          if (distanceA === null) return distanceB === null ? 0 : 1;
+          if (distanceB === null) return -1;
+          return sortConfig.direction === "ascending"
+            ? distanceA - distanceB
+            : distanceB - distanceA;
+        }
+
         if (valA < valB) {
           return sortConfig.direction === "ascending" ? -1 : 1;
         }
@@ -143,23 +133,15 @@ const VoluntaryOrganizations = () => {
       });
     }
     return sortableOrganizations;
-  };
-
-  const sortedData = useMemo(() => {
-    return sortedOrganizations(organizations || []);
   }, [organizations, sortConfig]);
 
-  const filteredOrganizations = (organizations) =>
-    organizations.filter((org) =>
-      Object.values(org).some(
-        (value) =>
-          typeof value === "string" &&
-          value.toLowerCase().includes(searchTerm.toLowerCase()),
+  const filteredData = useMemo(() => {
+    const term = searchTerm.toLowerCase();
+    return sortedData.filter((org) =>
+      Object.values(org).some((value) =>
+        typeof value === "string" && value.toLowerCase().includes(term),
       ),
     );
-
-  const filteredData = useMemo(() => {
-    return filteredOrganizations(sortedData);
   }, [sortedData, searchTerm]);
 
   const totalPages = (filteredData) => {
@@ -209,25 +191,7 @@ const VoluntaryOrganizations = () => {
       <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded">
         <p className="text-sm text-gray-600">
           <span className="font-semibold">Beneficiary Location: </span>
-          {(() => {
-            const isMyRequest =
-              requestData?.beneficiaryId === userDbId ||
-              !requestData?.beneficiaryId;
-            if (isMyRequest) {
-              const personalInfo = JSON.parse(
-                localStorage.getItem("personalInfo") || "{}",
-              );
-              const parts = [
-                personalInfo?.address,
-                personalInfo?.city,
-                personalInfo?.state,
-                personalInfo?.zipCode,
-                personalInfo?.country,
-              ].filter(Boolean);
-              return parts.length > 0 ? parts.join(", ") : "Not available";
-            }
-            return "Not available";
-          })()}
+          {requestData?.beneficiaryLocation || "Not available"}
         </p>
       </div>
 
